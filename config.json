@@ -2,49 +2,29 @@
   "auth": {
     "base_url": "https://confluence.your-company.com",
     "username": "YOUR_USERNAME",
-    "password": "YOUR_PASSWORD",
-    "auth_type": "basic"
+    "password": "YOUR_PASSWORD"
   },
 
   "target": {
     "space_key": "YOUR_SPACE_KEY",
-    "root_page_id": null,
+    "page_id": null,
     "page_title": null
   },
 
   "scroll_pdf": {
-    "export": {
-      "templateId": null,
-      "scope": "DESCENDANTS",
-      "versionCommentFilter": null,
-      "labelFilter": null,
-      "ancestorId": null,
-      "pageId": null
-    },
-    "rendering": {
-      "includeComments": false,
-      "includeUnresolvedComments": false,
-      "includeAttachments": false,
-      "includePageBreaks": true,
-      "pageBreakBetweenPages": true,
-      "screenshotsEnabled": true,
-      "screenshotWidth": 1280,
-      "watermarkText": null,
-      "watermarkEnabled": false,
-      "showPageNumbers": true,
-      "showTableOfContents": true,
-      "showTitle": true,
-      "showAuthor": false,
-      "showDate": false
-    },
-    "layout": {
-      "pageSize": "A4",
-      "orientation": "portrait",
-      "marginTopMm": 20,
-      "marginBottomMm": 20,
-      "marginLeftMm": 20,
-      "marginRightMm": 20
-    }
+    "templateId": null,
+
+    "scope": "descendants",
+
+    "locale": "tr-TR",
+
+    "timeZone": "Europe/Istanbul",
+
+    "versionId": null,
+
+    "variantId": null,
+
+    "languageKey": null
   },
 
   "output": {

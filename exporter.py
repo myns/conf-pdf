@@ -1,6 +1,5 @@
 import json
 import logging
-import os
 import sys
 import time
 from datetime import datetime
@@ -16,6 +15,8 @@ from urllib3.util.retry import Retry
 
 CONFIG_PATH = Path(__file__).parent / "config.json"
 
+SCROLL_API = "plugins/servlet/scroll-pdf/api/public/1"
+
 
 def load_config() -> dict:
     if not CONFIG_PATH.exists():
@@ -23,7 +24,6 @@ def load_config() -> dict:
     with open(CONFIG_PATH, encoding="utf-8") as f:
         cfg = json.load(f)
 
-    # Validate required fields
     required = [
         ("auth", "base_url"),
         ("auth", "username"),
@@ -70,7 +70,6 @@ def build_session(cfg: dict) -> requests.Session:
     session = requests.Session()
     session.auth = (auth_cfg["username"], auth_cfg["password"])
 
-    # SSL
     if not ssl_cfg.get("verify_ssl", True):
         logging.warning("SSL verification is DISABLED. Use only on trusted networks.")
         session.verify = False
@@ -79,7 +78,6 @@ def build_session(cfg: dict) -> requests.Session:
     elif ssl_cfg.get("ca_bundle_path"):
         session.verify = ssl_cfg["ca_bundle_path"]
 
-    # Retry on transient network errors only (not on 4xx/5xx job failures)
     retry = Retry(
         total=safety.get("max_retries", 3),
         backoff_factor=safety.get("retry_backoff_factor", 2),
@@ -126,46 +124,46 @@ def resolve_page_id(session: requests.Session, base_url: str, space_key: str,
     if not results:
         sys.exit(f"[ERROR] No page found with title '{page_title}' in space '{space_key}'.")
     if len(results) > 1:
-        log.warning(f"Multiple pages found with title '{page_title}', using the first one.")
+        log.warning(f"Multiple pages found for '{page_title}', using the first one.")
     page_id = results[0]["id"]
     log.info(f"Resolved page ID: {page_id}")
     return page_id
 
 
 # ---------------------------------------------------------------------------
-# Scroll PDF Export
+# Scroll PDF — Templates
 # ---------------------------------------------------------------------------
 
 def fetch_templates(session: requests.Session, base_url: str, space_key: str,
                     timeout: int, log: logging.Logger) -> list:
-    """Fetch available Scroll PDF templates for the given space."""
-    url = f"{base_url}/plugins/servlet/scroll-pdf/api/templates"
+    url = f"{base_url}/{SCROLL_API}/templates"
+    log.debug(f"GET {url}")
     try:
         r = session.get(url, params={"spaceKey": space_key}, timeout=timeout)
         if r.status_code == 200:
             data = r.json()
-            # Response may be a list directly or wrapped in a key
-            if isinstance(data, list):
-                return data
-            return data.get("templates") or data.get("results") or []
+            return data if isinstance(data, list) else (data.get("templates") or data.get("results") or [])
+        log.debug(f"Templates endpoint returned {r.status_code}")
     except Exception as e:
         log.debug(f"Template fetch failed: {e}")
     return []
 
 
 def resolve_template_id(session: requests.Session, base_url: str, space_key: str,
-                         cfg_template_id, timeout: int, log: logging.Logger):
-    """Return templateId from config if set, otherwise auto-discover first available."""
+                        cfg_template_id, timeout: int, log: logging.Logger):
     if cfg_template_id:
         log.info(f"Using templateId from config: {cfg_template_id}")
         return cfg_template_id
 
-    log.info("templateId not set in config, fetching available templates...")
+    log.info("templateId not set — fetching available templates...")
     templates = fetch_templates(session, base_url, space_key, timeout, log)
 
     if not templates:
-        log.warning("Could not fetch templates — will attempt export without templateId.")
-        return None
+        sys.exit(
+            "[ERROR] templateId is not set in config and auto-discovery returned no templates.\n"
+            "  Go to: Space Tools > Add-ons > Scroll PDF Exporter > Template Information\n"
+            "  Copy the templateId and set it in config.json under scroll_pdf.templateId"
+        )
 
     log.info(f"Available templates ({len(templates)}):")
     for t in templates:
@@ -175,80 +173,49 @@ def resolve_template_id(session: requests.Session, base_url: str, space_key: str
 
     first = templates[0]
     chosen = first.get("id") or first.get("templateId")
-    log.info(f"Auto-selected first template: {chosen} — set 'scroll_pdf.export.templateId' in config to override.")
+    log.info(f"Auto-selected template: {chosen}  (set scroll_pdf.templateId in config to override)")
     return chosen
 
 
-def build_export_payload(cfg: dict, page_id: str, template_id) -> dict:
-    target = cfg["target"]
+# ---------------------------------------------------------------------------
+# Scroll PDF — Export
+# ---------------------------------------------------------------------------
+
+def build_export_payload(cfg: dict, page_id: str, template_id: str) -> dict:
+    """
+    Correct Scroll PDF Exporter Server/DC payload.
+    Docs: help.k15t.com/scroll-pdf-exporter — Export Content via REST API (Server)
+    """
     sp = cfg["scroll_pdf"]
 
+    # Required fields
     payload = {
-        "spaceKey": target["space_key"],
-        "scope": sp["export"].get("scope", "DESCENDANTS"),
+        "pageId": str(page_id),
+        "templateId": str(template_id),
     }
 
-    if page_id:
-        payload["rootPageId"] = page_id
-
-    if template_id:
-        payload["templateId"] = template_id
-
-    for key in ("versionCommentFilter", "labelFilter", "ancestorId"):
-        val = sp["export"].get(key)
+    # Optional fields — only add when explicitly set
+    optional = {
+        "scope":       sp.get("scope"),          # "current" | "descendants" | "document"
+        "locale":      sp.get("locale"),          # BCP 47, e.g. "tr-TR", "en-US"
+        "timeZone":    sp.get("timeZone"),        # IANA, e.g. "Europe/Istanbul"
+        "versionId":   sp.get("versionId"),       # Scroll Versions only
+        "variantId":   sp.get("variantId"),       # Scroll Documents/Versions only
+        "languageKey": sp.get("languageKey"),     # Scroll Translations only
+    }
+    for key, val in optional.items():
         if val is not None:
             payload[key] = val
-
-    # Rendering options — only send non-null values
-    rendering = sp.get("rendering", {})
-    rendering_map = {
-        "includeComments": "includeComments",
-        "includeUnresolvedComments": "includeUnresolvedComments",
-        "includeAttachments": "includeAttachments",
-        "includePageBreaks": "includePageBreaks",
-        "pageBreakBetweenPages": "pageBreakBetweenPages",
-        "screenshotsEnabled": "screenshotsEnabled",
-        "screenshotWidth": "screenshotWidth",
-        "watermarkText": "watermarkText",
-        "watermarkEnabled": "watermarkEnabled",
-        "showPageNumbers": "showPageNumbers",
-        "showTableOfContents": "showTableOfContents",
-        "showTitle": "showTitle",
-        "showAuthor": "showAuthor",
-        "showDate": "showDate",
-    }
-    for cfg_key, api_key in rendering_map.items():
-        val = rendering.get(cfg_key)
-        if val is not None:
-            payload[api_key] = val
-
-    # Layout — only send non-null values
-    layout = sp.get("layout", {})
-    layout_map = {
-        "pageSize": "pageSize",
-        "orientation": "orientation",
-        "marginTopMm": "marginTopMm",
-        "marginBottomMm": "marginBottomMm",
-        "marginLeftMm": "marginLeftMm",
-        "marginRightMm": "marginRightMm",
-    }
-    for cfg_key, api_key in layout_map.items():
-        val = layout.get(cfg_key)
-        if val is not None:
-            payload[api_key] = val
 
     return payload
 
 
-SCROLL_PDF_BASE = "plugins/servlet/scroll-pdf/api/exports"
-
-
 def start_export_job(session: requests.Session, base_url: str, payload: dict,
-                     timeout: int, log: logging.Logger) -> tuple[str, str | None]:
-    url = f"{base_url}/{SCROLL_PDF_BASE}"
+                     timeout: int, log: logging.Logger) -> str:
+    url = f"{base_url}/{SCROLL_API}/exports"
     log.info("Starting Scroll PDF export job...")
     log.debug(f"POST {url}")
-    log.debug(f"Payload: {json.dumps(payload, indent=2)}")
+    log.info(f"Payload: {json.dumps(payload, indent=2)}")
 
     r = session.post(url, json=payload, timeout=timeout)
 
@@ -260,108 +227,112 @@ def start_export_job(session: requests.Session, base_url: str, payload: dict,
         sys.exit(
             f"[ERROR] 400 Bad Request — server rejected the payload.\n"
             f"  URL: {url}\n"
-            f"  Sent payload: {json.dumps(payload, indent=2)}\n"
-            f"  Server response: {body}"
+            f"  Sent: {json.dumps(payload, indent=2)}\n"
+            f"  Server says: {body}"
         )
     if r.status_code == 401:
-        sys.exit("[ERROR] Authentication failed (401). Check username and password.")
+        sys.exit("[ERROR] 401 Unauthorized — check username and password.")
     if r.status_code == 403:
-        sys.exit("[ERROR] Permission denied (403). Your account may not have export rights.")
+        sys.exit("[ERROR] 403 Forbidden — your account may lack export permissions.")
     if r.status_code == 404:
         sys.exit(
-            "[ERROR] Scroll PDF endpoint not found (404).\n"
+            f"[ERROR] 404 Not Found — Scroll PDF endpoint not found.\n"
             f"  Tried: {url}\n"
-            "  Confirm the Scroll PDF Exporter plugin is installed and the base_url is correct."
+            "  Check that Scroll PDF Exporter plugin is installed and base_url is correct."
         )
     r.raise_for_status()
 
     data = r.json()
-    log.debug(f"Response: {data}")
+    log.debug(f"Start response: {data}")
 
-    # API returns the job as a resource — id or jobId field, and sometimes a self/download link
-    job_id = (
-        data.get("id")
-        or data.get("jobId")
-        or data.get("exportId")
-    )
+    job_id = data.get("jobId") or data.get("id") or data.get("exportId")
     if not job_id:
-        sys.exit(f"[ERROR] Export job started but no job ID returned. Response: {data}")
-
-    # Some versions return a ready download URL immediately
-    download_url = data.get("downloadUrl") or data.get("download")
+        sys.exit(f"[ERROR] No job ID in response. Full response: {data}")
 
     log.info(f"Export job started. Job ID: {job_id}")
-    return str(job_id), download_url
+    return str(job_id)
 
 
-def poll_job(session: requests.Session, base_url: str, job_id: str, cfg: dict,
-             log: logging.Logger) -> str | None:
-    """Returns a download URL if the API provides one in the status response."""
+def poll_job(session: requests.Session, base_url: str, job_id: str,
+             cfg: dict, log: logging.Logger) -> str | None:
+    """
+    Poll GET /exports/{jobId}/status until complete.
+    Returns downloadUrl from the status response (may be None if not provided).
+    """
     safety = cfg.get("safety", {})
     poll_interval = safety.get("poll_interval_sec", 10)
     max_attempts = safety.get("max_poll_attempts", 30)
     timeout = safety.get("request_timeout_sec", 60)
 
-    url = f"{base_url}/{SCROLL_PDF_BASE}/{job_id}"
+    status_url = f"{base_url}/{SCROLL_API}/exports/{job_id}/status"
 
     for attempt in range(1, max_attempts + 1):
         log.info(f"Checking job status... (attempt {attempt}/{max_attempts})")
-        r = session.get(url, timeout=timeout)
-        r.raise_for_status()
-        data = r.json()
-        log.debug(f"Status response: {data}")
+        r = session.get(status_url, timeout=timeout)
 
+        if r.status_code == 404:
+            sys.exit(f"[ERROR] Status endpoint returned 404 — job ID may be invalid: {job_id}")
+        r.raise_for_status()
+
+        data = r.json()
+        log.debug(f"Status: {data}")
+
+        # API uses "step" + "totalSteps" for progress, and "status" or "state" for completion
         status = (data.get("status") or data.get("state") or "").upper()
-        progress = data.get("progress") or data.get("percentage") or ""
-        if progress:
-            log.info(f"Status: {status} — Progress: {progress}%")
+        step = data.get("step")
+        total_steps = data.get("totalSteps")
+        step_progress = data.get("stepProgress", "")
+
+        if step and total_steps:
+            log.info(f"Status: {status} — step {step}/{total_steps} ({step_progress}%)")
         else:
             log.info(f"Status: {status}")
 
-        if status in ("COMPLETED", "DONE", "SUCCESS", "FINISHED"):
-            log.info("Export job completed.")
+        if status in ("COMPLETED", "COMPLETE", "DONE", "SUCCESS", "FINISHED"):
+            log.info("Export completed.")
             return data.get("downloadUrl") or data.get("download")
 
-        if status in ("FAILED", "ERROR", "CANCELLED"):
-            error_msg = data.get("errorMessage") or data.get("message") or "No details provided."
-            sys.exit(f"[ERROR] Export job failed. Status: {status}. Message: {error_msg}")
+        if status in ("FAILED", "ERROR", "CANCELLED", "ABORTED"):
+            error_msg = data.get("errorMessage") or data.get("message") or str(data)
+            sys.exit(f"[ERROR] Export job failed. Status: {status}. Details: {error_msg}")
 
         if attempt < max_attempts:
-            log.info(f"Waiting {poll_interval}s before next check...")
+            log.info(f"Waiting {poll_interval}s...")
             time.sleep(poll_interval)
 
     sys.exit(
-        f"[ERROR] Export job did not complete after {max_attempts} attempts "
-        f"({max_attempts * poll_interval}s total). "
-        "Consider increasing 'safety.max_poll_attempts' or 'safety.poll_interval_sec' in config.json."
+        f"[ERROR] Export did not complete after {max_attempts} attempts "
+        f"({max_attempts * poll_interval}s total).\n"
+        "  Increase 'safety.max_poll_attempts' or 'safety.poll_interval_sec' in config.json."
     )
 
+
+# ---------------------------------------------------------------------------
+# Download
+# ---------------------------------------------------------------------------
 
 def download_pdf(session: requests.Session, base_url: str, job_id: str,
                  output_path: Path, timeout: int, log: logging.Logger,
                  download_url: str | None = None) -> None:
-    # Use API-provided URL if available, otherwise fall back to conventional path
-    url = download_url or f"{base_url}/{SCROLL_PDF_BASE}/{job_id}/download"
-    log.info(f"Downloading PDF from {url}...")
+    url = download_url or f"{base_url}/{SCROLL_API}/exports/{job_id}/download"
+    log.info(f"Downloading PDF from: {url}")
 
-    # Check disk space (rough estimate: 500MB free required)
     free_bytes = _free_disk_bytes(output_path.parent)
-    if free_bytes is not None and free_bytes < 500 * 1024 * 1024:
-        log.warning(f"Low disk space: {free_bytes // (1024*1024)} MB free. Proceeding anyway.")
+    if free_bytes is not None and free_bytes < 200 * 1024 * 1024:
+        log.warning(f"Low disk space: {free_bytes // (1024 * 1024)} MB free.")
 
     with session.get(url, stream=True, timeout=timeout) as r:
         if r.status_code == 404:
-            sys.exit("[ERROR] Download URL not found (404). The job may have expired.")
+            sys.exit("[ERROR] Download URL returned 404 — job may have expired.")
         r.raise_for_status()
 
         total = int(r.headers.get("content-length", 0))
         downloaded = 0
-        chunk_size = 1024 * 1024  # 1 MB chunks
+        chunk_size = 1024 * 1024  # 1 MB
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # Write to temp file first, rename on success to avoid partial files
         tmp_path = output_path.with_suffix(".tmp")
+
         try:
             with open(tmp_path, "wb") as f:
                 for chunk in r.iter_content(chunk_size=chunk_size):
@@ -370,18 +341,19 @@ def download_pdf(session: requests.Session, base_url: str, job_id: str,
                         downloaded += len(chunk)
                         if total:
                             pct = downloaded * 100 // total
-                            print(f"\r  Downloaded: {downloaded // 1024} KB / {total // 1024} KB ({pct}%)", end="", flush=True)
-            print()  # newline after progress
+                            print(f"\r  {downloaded // 1024} KB / {total // 1024} KB ({pct}%)",
+                                  end="", flush=True)
+            print()
             tmp_path.rename(output_path)
-        except Exception as e:
+        except Exception:
             tmp_path.unlink(missing_ok=True)
             raise
 
-    file_size = output_path.stat().st_size
-    if file_size < 1024:
-        log.warning(f"Downloaded file is suspiciously small ({file_size} bytes). It may be an error response.")
+    size = output_path.stat().st_size
+    if size < 1024:
+        log.warning(f"Downloaded file is very small ({size} bytes) — may be an error page.")
     else:
-        log.info(f"PDF saved: {output_path} ({file_size // 1024} KB)")
+        log.info(f"Saved: {output_path}  ({size // 1024} KB)")
 
 
 def _free_disk_bytes(path: Path):
@@ -405,16 +377,13 @@ def build_output_path(cfg: dict) -> Path:
     space_key = cfg["target"]["space_key"]
     dt_str = datetime.now().strftime(dt_format)
     filename = pattern.format(space_key=space_key, datetime=dt_str) + ".pdf"
-    # Sanitize filename
-    filename = "".join(c if c.isalnum() or c in "-_. " else "_" for c in filename)
+    filename = "".join(c if c.isalnum() or c in "-_." else "_" for c in filename)
 
     candidate = output_dir / filename
-    # Avoid overwriting existing file
     if candidate.exists():
-        base = candidate.stem
-        suffix = candidate.suffix
+        stem = candidate.stem
         for i in range(2, 100):
-            candidate = output_dir / f"{base}_v{i}{suffix}"
+            candidate = output_dir / f"{stem}_v{i}.pdf"
             if not candidate.exists():
                 break
 
@@ -438,23 +407,26 @@ def main():
     session = build_session(cfg)
     test_connection(session, base_url, timeout, log)
 
-    # Resolve page ID if needed
-    page_id = target.get("root_page_id")
+    # Resolve page ID
+    page_id = target.get("page_id")
     if not page_id and target.get("page_title"):
         page_id = resolve_page_id(
             session, base_url, target["space_key"], target["page_title"], timeout, log
         )
+    if not page_id:
+        sys.exit("[ERROR] Either 'target.page_id' or 'target.page_title' must be set in config.json.")
 
+    # Resolve template ID
     template_id = resolve_template_id(
         session, base_url, target["space_key"],
-        cfg["scroll_pdf"]["export"].get("templateId"),
+        cfg["scroll_pdf"].get("templateId"),
         timeout, log,
     )
-    payload = build_export_payload(cfg, str(page_id) if page_id else None, template_id)
-    job_id, immediate_download_url = start_export_job(session, base_url, payload, timeout, log)
-    polled_download_url = poll_job(session, base_url, job_id, cfg, log)
 
-    download_url = immediate_download_url or polled_download_url
+    payload = build_export_payload(cfg, page_id, template_id)
+    job_id = start_export_job(session, base_url, payload, timeout, log)
+    download_url = poll_job(session, base_url, job_id, cfg, log)
+
     output_path = build_output_path(cfg)
     download_pdf(session, base_url, job_id, output_path, timeout, log, download_url=download_url)
 
