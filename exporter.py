@@ -136,7 +136,50 @@ def resolve_page_id(session: requests.Session, base_url: str, space_key: str,
 # Scroll PDF Export
 # ---------------------------------------------------------------------------
 
-def build_export_payload(cfg: dict, page_id: str) -> dict:
+def fetch_templates(session: requests.Session, base_url: str, space_key: str,
+                    timeout: int, log: logging.Logger) -> list:
+    """Fetch available Scroll PDF templates for the given space."""
+    url = f"{base_url}/plugins/servlet/scroll-pdf/api/templates"
+    try:
+        r = session.get(url, params={"spaceKey": space_key}, timeout=timeout)
+        if r.status_code == 200:
+            data = r.json()
+            # Response may be a list directly or wrapped in a key
+            if isinstance(data, list):
+                return data
+            return data.get("templates") or data.get("results") or []
+    except Exception as e:
+        log.debug(f"Template fetch failed: {e}")
+    return []
+
+
+def resolve_template_id(session: requests.Session, base_url: str, space_key: str,
+                         cfg_template_id, timeout: int, log: logging.Logger):
+    """Return templateId from config if set, otherwise auto-discover first available."""
+    if cfg_template_id:
+        log.info(f"Using templateId from config: {cfg_template_id}")
+        return cfg_template_id
+
+    log.info("templateId not set in config, fetching available templates...")
+    templates = fetch_templates(session, base_url, space_key, timeout, log)
+
+    if not templates:
+        log.warning("Could not fetch templates — will attempt export without templateId.")
+        return None
+
+    log.info(f"Available templates ({len(templates)}):")
+    for t in templates:
+        tid = t.get("id") or t.get("templateId")
+        name = t.get("name") or t.get("title") or tid
+        log.info(f"  id={tid}  name={name}")
+
+    first = templates[0]
+    chosen = first.get("id") or first.get("templateId")
+    log.info(f"Auto-selected first template: {chosen} — set 'scroll_pdf.export.templateId' in config to override.")
+    return chosen
+
+
+def build_export_payload(cfg: dict, page_id: str, template_id) -> dict:
     target = cfg["target"]
     sp = cfg["scroll_pdf"]
 
@@ -145,17 +188,18 @@ def build_export_payload(cfg: dict, page_id: str) -> dict:
         "scope": sp["export"].get("scope", "DESCENDANTS"),
     }
 
-    # Root / anchor page
     if page_id:
         payload["rootPageId"] = page_id
 
-    # Optional export filters
-    for key in ("templateId", "versionCommentFilter", "labelFilter", "ancestorId"):
+    if template_id:
+        payload["templateId"] = template_id
+
+    for key in ("versionCommentFilter", "labelFilter", "ancestorId"):
         val = sp["export"].get(key)
         if val is not None:
             payload[key] = val
 
-    # Rendering options
+    # Rendering options — only send non-null values
     rendering = sp.get("rendering", {})
     rendering_map = {
         "includeComments": "includeComments",
@@ -178,7 +222,7 @@ def build_export_payload(cfg: dict, page_id: str) -> dict:
         if val is not None:
             payload[api_key] = val
 
-    # Layout
+    # Layout — only send non-null values
     layout = sp.get("layout", {})
     layout_map = {
         "pageSize": "pageSize",
@@ -401,7 +445,12 @@ def main():
             session, base_url, target["space_key"], target["page_title"], timeout, log
         )
 
-    payload = build_export_payload(cfg, str(page_id) if page_id else None)
+    template_id = resolve_template_id(
+        session, base_url, target["space_key"],
+        cfg["scroll_pdf"]["export"].get("templateId"),
+        timeout, log,
+    )
+    payload = build_export_payload(cfg, str(page_id) if page_id else None, template_id)
     job_id, immediate_download_url = start_export_job(session, base_url, payload, timeout, log)
     polled_download_url = poll_job(session, base_url, job_id, cfg, log)
 
