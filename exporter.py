@@ -196,46 +196,65 @@ def build_export_payload(cfg: dict, page_id: str) -> dict:
     return payload
 
 
+SCROLL_PDF_BASE = "plugins/servlet/scroll-pdf/api/exports"
+
+
 def start_export_job(session: requests.Session, base_url: str, payload: dict,
-                     timeout: int, log: logging.Logger) -> str:
-    url = f"{base_url}/rest/scroll-pdf/1.0/export"
-    log.info(f"Starting Scroll PDF export job...")
+                     timeout: int, log: logging.Logger) -> tuple[str, str | None]:
+    url = f"{base_url}/{SCROLL_PDF_BASE}"
+    log.info("Starting Scroll PDF export job...")
+    log.debug(f"POST {url}")
     log.debug(f"Payload: {json.dumps(payload, indent=2)}")
 
     r = session.post(url, json=payload, timeout=timeout)
 
-    if r.status_code == 404:
-        sys.exit("[ERROR] Scroll PDF plugin endpoint not found (404). "
-                 "Confirm the Scroll PDF Exporter plugin is installed on this Confluence instance.")
     if r.status_code == 401:
         sys.exit("[ERROR] Authentication failed (401). Check username and password.")
     if r.status_code == 403:
         sys.exit("[ERROR] Permission denied (403). Your account may not have export rights.")
+    if r.status_code == 404:
+        sys.exit(
+            "[ERROR] Scroll PDF endpoint not found (404).\n"
+            f"  Tried: {url}\n"
+            "  Confirm the Scroll PDF Exporter plugin is installed and the base_url is correct."
+        )
     r.raise_for_status()
 
     data = r.json()
-    job_id = data.get("jobId") or data.get("id") or data.get("exportId")
+    log.debug(f"Response: {data}")
+
+    # API returns the job as a resource — id or jobId field, and sometimes a self/download link
+    job_id = (
+        data.get("id")
+        or data.get("jobId")
+        or data.get("exportId")
+    )
     if not job_id:
         sys.exit(f"[ERROR] Export job started but no job ID returned. Response: {data}")
 
+    # Some versions return a ready download URL immediately
+    download_url = data.get("downloadUrl") or data.get("download")
+
     log.info(f"Export job started. Job ID: {job_id}")
-    return str(job_id)
+    return str(job_id), download_url
 
 
 def poll_job(session: requests.Session, base_url: str, job_id: str, cfg: dict,
-             log: logging.Logger) -> None:
+             log: logging.Logger) -> str | None:
+    """Returns a download URL if the API provides one in the status response."""
     safety = cfg.get("safety", {})
     poll_interval = safety.get("poll_interval_sec", 10)
     max_attempts = safety.get("max_poll_attempts", 30)
     timeout = safety.get("request_timeout_sec", 60)
 
-    url = f"{base_url}/rest/scroll-pdf/1.0/export/{job_id}"
+    url = f"{base_url}/{SCROLL_PDF_BASE}/{job_id}"
 
     for attempt in range(1, max_attempts + 1):
         log.info(f"Checking job status... (attempt {attempt}/{max_attempts})")
         r = session.get(url, timeout=timeout)
         r.raise_for_status()
         data = r.json()
+        log.debug(f"Status response: {data}")
 
         status = (data.get("status") or data.get("state") or "").upper()
         progress = data.get("progress") or data.get("percentage") or ""
@@ -246,7 +265,8 @@ def poll_job(session: requests.Session, base_url: str, job_id: str, cfg: dict,
 
         if status in ("COMPLETED", "DONE", "SUCCESS", "FINISHED"):
             log.info("Export job completed.")
-            return
+            return data.get("downloadUrl") or data.get("download")
+
         if status in ("FAILED", "ERROR", "CANCELLED"):
             error_msg = data.get("errorMessage") or data.get("message") or "No details provided."
             sys.exit(f"[ERROR] Export job failed. Status: {status}. Message: {error_msg}")
@@ -263,8 +283,10 @@ def poll_job(session: requests.Session, base_url: str, job_id: str, cfg: dict,
 
 
 def download_pdf(session: requests.Session, base_url: str, job_id: str,
-                 output_path: Path, timeout: int, log: logging.Logger) -> None:
-    url = f"{base_url}/rest/scroll-pdf/1.0/export/{job_id}/download"
+                 output_path: Path, timeout: int, log: logging.Logger,
+                 download_url: str | None = None) -> None:
+    # Use API-provided URL if available, otherwise fall back to conventional path
+    url = download_url or f"{base_url}/{SCROLL_PDF_BASE}/{job_id}/download"
     log.info(f"Downloading PDF from {url}...")
 
     # Check disk space (rough estimate: 500MB free required)
@@ -369,11 +391,12 @@ def main():
         )
 
     payload = build_export_payload(cfg, str(page_id) if page_id else None)
-    job_id = start_export_job(session, base_url, payload, timeout, log)
-    poll_job(session, base_url, job_id, cfg, log)
+    job_id, immediate_download_url = start_export_job(session, base_url, payload, timeout, log)
+    polled_download_url = poll_job(session, base_url, job_id, cfg, log)
 
+    download_url = immediate_download_url or polled_download_url
     output_path = build_output_path(cfg)
-    download_pdf(session, base_url, job_id, output_path, timeout, log)
+    download_pdf(session, base_url, job_id, output_path, timeout, log, download_url=download_url)
 
     log.info("Done.")
 
