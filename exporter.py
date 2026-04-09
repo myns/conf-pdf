@@ -208,6 +208,17 @@ def start_export_job(session: requests.Session, base_url: str, payload: dict,
 
     r = session.post(url, json=payload, timeout=timeout)
 
+    if r.status_code == 400:
+        try:
+            body = r.json()
+        except Exception:
+            body = r.text
+        sys.exit(
+            f"[ERROR] 400 Bad Request — server rejected the payload.\n"
+            f"  URL: {url}\n"
+            f"  Sent payload: {json.dumps(payload, indent=2)}\n"
+            f"  Server response: {body}"
+        )
     if r.status_code == 401:
         sys.exit("[ERROR] Authentication failed (401). Check username and password.")
     if r.status_code == 403:
