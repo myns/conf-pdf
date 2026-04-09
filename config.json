@@ -1,0 +1,74 @@
+{
+  "auth": {
+    "base_url": "https://confluence.your-company.com",
+    "username": "YOUR_USERNAME",
+    "password": "YOUR_PASSWORD",
+    "auth_type": "basic"
+  },
+
+  "target": {
+    "space_key": "YOUR_SPACE_KEY",
+    "root_page_id": null,
+    "page_title": null
+  },
+
+  "scroll_pdf": {
+    "export": {
+      "templateId": null,
+      "scope": "DESCENDANTS",
+      "versionCommentFilter": null,
+      "labelFilter": null,
+      "ancestorId": null,
+      "pageId": null
+    },
+    "rendering": {
+      "includeComments": false,
+      "includeUnresolvedComments": false,
+      "includeAttachments": false,
+      "includePageBreaks": true,
+      "pageBreakBetweenPages": true,
+      "screenshotsEnabled": true,
+      "screenshotWidth": 1280,
+      "watermarkText": null,
+      "watermarkEnabled": false,
+      "showPageNumbers": true,
+      "showTableOfContents": true,
+      "showTitle": true,
+      "showAuthor": false,
+      "showDate": false
+    },
+    "layout": {
+      "pageSize": "A4",
+      "orientation": "portrait",
+      "marginTopMm": 20,
+      "marginBottomMm": 20,
+      "marginLeftMm": 20,
+      "marginRightMm": 20
+    }
+  },
+
+  "output": {
+    "output_dir": "./output",
+    "filename_pattern": "{space_key}_{datetime}",
+    "datetime_format": "%Y-%m-%d_%H-%M-%S"
+  },
+
+  "safety": {
+    "request_timeout_sec": 60,
+    "poll_interval_sec": 10,
+    "max_poll_attempts": 30,
+    "max_retries": 3,
+    "retry_backoff_factor": 2
+  },
+
+  "ssl": {
+    "verify_ssl": true,
+    "ca_bundle_path": null
+  },
+
+  "logging": {
+    "level": "INFO",
+    "log_to_file": false,
+    "log_file": "./exporter.log"
+  }
+}
